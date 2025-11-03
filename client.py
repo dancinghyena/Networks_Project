@@ -11,9 +11,9 @@ MSG_INIT = 0
 MSG_DATA = 1
 MSG_ACK = 3
 
-# Full header format (8 fields)
+
 HEADER_FORMAT = "!4s B B I I Q H I"
-# Header format without the final checksum field (7 fields)
+
 HEADER_FORMAT_NO_CHECKSUM = "!4s B B I I Q H"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
@@ -39,10 +39,10 @@ def build_packet(msg_type, seq_num, payload=b""):
         payload_len,  # payload length (2 bytes)
     )
 
-    # Compute checksum over header_wo_checksum + payload
+    
     checksum = calculate_checksum(header_wo_checksum + payload)
 
-    # Pack full header including checksum
+   
     header = struct.pack(
         HEADER_FORMAT,
         b"NRSH",
@@ -83,7 +83,7 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     seq_num = 0
 
-    # Send INIT packet
+    
     init_payload = b"PlayerName:A1"
     packet = build_packet(MSG_INIT, seq_num, init_payload)
     sock.sendto(packet, (SERVER_IP, SERVER_PORT))
@@ -92,7 +92,7 @@ def main():
     # Start listener thread
     threading.Thread(target=listen_for_acks, args=(sock,), daemon=True).start()
 
-    # Send some DATA packets (simulate player movement)
+    # Send some DATA packets 
     for i in range(5):
         seq_num += 1
         payload = f"Action:MOVE_UP | Step:{i}".encode()
@@ -101,7 +101,7 @@ def main():
         print(f"[Client] Sent DATA packet #{seq_num}")
         time.sleep(0.5)
 
-    # give some time to receive ACKs before exiting
+   
     time.sleep(1.0)
     sock.close()
 

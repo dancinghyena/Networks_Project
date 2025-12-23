@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
-"""
-client.py
-UDP client for Grid Clash with INIT/ACK handshake and retransmission.
-- Sends INIT on startup, retries until ACK received
-- Receives assigned ID and initial grid state from server
-- Sends ACQUIRE_REQUEST for cell clicks
-- Receives and applies SNAPSHOT updates
-- Handles GAME_OVER message
-"""
 
 import socket
 import threading
 import json
 import time
+import struct
+import zlib
 import pygame
 import sys
+import csv
 from copy import deepcopy
+from collections import deque
 
 # Server configuration
 SERVER_HOST = "127.0.0.1"
@@ -30,6 +25,19 @@ WINDOW_SIZE = GRID_N * CELL_SIZE
 INIT_TIMEOUT = 0.1  # 100ms
 MAX_INIT_RETRIES = 3
 
+# Interpolation configuration
+INTERPOLATION_DELAY_MS = 100  # Render 100ms in the past for smoothing
+SNAPSHOT_BUFFER_SIZE = 50     # Keep last 50 snapshots for interpolation
+
+# NetRush Protocol Constants
+PROTOCOL_ID = b"NRSH"
+VERSION = 1
+MSG_TYPE_INIT = 0
+MSG_TYPE_DATA = 1
+MSG_TYPE_EVENT = 2
+MSG_TYPE_ACK = 3
+HEADER_SIZE = 28
+
 # Client state
 client_id = None
 grid = [['UNCLAIMED' for _ in range(GRID_N)] for _ in range(GRID_N)]
@@ -38,6 +46,16 @@ lock = threading.Lock()
 running = True
 game_over = False
 winner = None
+
+# Snapshot buffer for interpolation (stores {snapshot_id, timestamp, grid_state})
+snapshot_buffer = deque(maxlen=SNAPSHOT_BUFFER_SIZE)
+
+# Metrics tracking
+latencies = []
+last_recv_time = None
+jitter_values = []
+client_log_file = None
+client_log_writer = None
 
 # Socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -51,26 +69,125 @@ COLORS = {
     'text': (255, 255, 255)
 }
 
+def init_logging():
+    """Initialize CSV logging for client metrics"""
+    global client_log_file, client_log_writer
+    log_filename = f"client_{client_id}_log.csv" if client_id else "client_log.csv"
+    client_log_file = open(log_filename, "w", newline="")
+    client_log_writer = csv.DictWriter(client_log_file, fieldnames=[
+        'client_id', 'snapshot_id', 'seq_num', 'server_timestamp_ms',
+        'recv_time_ms', 'latency_ms', 'jitter_ms', 'perceived_position_error'
+    ])
+    client_log_writer.writeheader()
+
+def log_snapshot_metrics(snapshot_id, seq_num, server_timestamp_ms, recv_time_ms, latency_ms, jitter_ms):
+    """Log snapshot metrics to CSV"""
+    if client_log_writer:
+        client_log_writer.writerow({
+            'client_id': client_id,
+            'snapshot_id': snapshot_id,
+            'seq_num': seq_num,
+            'server_timestamp_ms': server_timestamp_ms,
+            'recv_time_ms': recv_time_ms,
+            'latency_ms': latency_ms,
+            'jitter_ms': jitter_ms,
+            'perceived_position_error': 0  # Grid-based game, error is binary (correct/incorrect cell state)
+        })
+        client_log_file.flush()
+
+def create_header(msg_type, snapshot_id, seq_num, payload):
+    """Create NetRush protocol header"""
+    server_timestamp = int(time.time() * 1000)
+    payload_len = len(payload)
+    checksum = zlib.crc32(payload) & 0xFFFFFFFF
+    
+    header = struct.pack(
+        '!4s B B I I Q H I',
+        PROTOCOL_ID,      
+        VERSION,          
+        msg_type,         
+        snapshot_id,      
+        seq_num,          
+        server_timestamp, 
+        payload_len,      
+        checksum          
+    )
+    return header
+
+def parse_header(data):
+    
+    if len(data) < HEADER_SIZE:
+        return None
+    
+    try:
+        protocol_id, version, msg_type, snapshot_id, seq_num, server_timestamp, payload_len, checksum = struct.unpack(
+            '!4s B B I I Q H I',
+            data[:HEADER_SIZE]
+        )
+        
+        if protocol_id != PROTOCOL_ID:
+            return None
+        
+        return {
+            'protocol_id': protocol_id,
+            'version': version,
+            'msg_type': msg_type,
+            'snapshot_id': snapshot_id,
+            'seq_num': seq_num,
+            'server_timestamp': server_timestamp,
+            'payload_len': payload_len,
+            'checksum': checksum
+        }
+    except:
+        return None
+
 def get_player_color(player_id):
-    """Generate a consistent color for each player ID"""
+    
     if player_id == 'UNCLAIMED':
         return COLORS['UNCLAIMED']
     
     # Hash the player_id to get consistent colors
-    hash_val = hash(str(player_id))
-    r = (hash_val & 0xFF0000) >> 16
-    g = (hash_val & 0x00FF00) >> 8
-    b = (hash_val & 0x0000FF)
+    match player_id:
+        case 1:
+            return (255, 0, 0)  # Red
+        case 2:
+            return (0, 255, 0)  # Green
+        case 3:
+            return (0, 0, 255)  # Blue
+        case 4:
+            return (255, 255, 0)  # Yellow
+        case _:
+            # Generate color based on hash
+            h = hash(player_id)
+            r = (h & 0xFF0000) >> 16
+            g = (h & 0x00FF00) >> 8
+            b = h & 0x0000FF;
+            return (r, g, b)
+
+def get_interpolated_grid():
     
-    # Ensure colors are bright enough
-    r = max(100, r)
-    g = max(100, g)
-    b = max(100, b)
+    if not snapshot_buffer:
+        return grid
     
-    return (r, g, b)
+    target_time = int(time.time() * 1000) - INTERPOLATION_DELAY_MS
+    
+
+    best_snapshot = None
+    min_diff = float('inf')
+    
+    for snapshot in snapshot_buffer:
+        diff = abs(snapshot['recv_time_ms'] - target_time)
+        if diff < min_diff:
+            min_diff = diff
+            best_snapshot = snapshot
+    
+    if best_snapshot:
+        return best_snapshot['grid_state']
+    
+    return grid
 
 def send_init():
-    """Send INIT message and wait for ACK with retransmission"""
+    
     global client_id, grid
     
     print("[CLIENT] Sending INIT to server...")
@@ -81,8 +198,15 @@ def send_init():
             'timestamp': time.time()
         }
         
+        payload = json.dumps(init_msg).encode()
+        header = create_header(MSG_TYPE_INIT, 0, 0, payload)
+        packet = header + payload
+        
+        print(f"[CLIENT] Packet size: {len(packet)} bytes (header: {HEADER_SIZE}, payload: {len(payload)})")
+        print(f"[CLIENT] Header bytes: {packet[:HEADER_SIZE].hex()}")
+        
         try:
-            sock.sendto(json.dumps(init_msg).encode(), (SERVER_HOST, SERVER_PORT))
+            sock.sendto(packet, (SERVER_HOST, SERVER_PORT))
             print(f"[CLIENT] INIT sent (attempt {attempt + 1}/{MAX_INIT_RETRIES})")
         except Exception as e:
             print(f"[CLIENT] Failed to send INIT: {e}")
@@ -93,7 +217,19 @@ def send_init():
         while time.time() - start_time < INIT_TIMEOUT:
             try:
                 data, addr = sock.recvfrom(65536)
-                msg = json.loads(data.decode())
+                
+                # Parse header
+                header_data = parse_header(data)
+                if not header_data or header_data['msg_type'] != MSG_TYPE_ACK:
+                    continue
+                
+                # Extract and verify payload
+                payload_data = data[HEADER_SIZE:HEADER_SIZE + header_data['payload_len']]
+                calculated_checksum = zlib.crc32(payload_data) & 0xFFFFFFFF
+                if calculated_checksum != header_data['checksum']:
+                    continue
+                
+                msg = json.loads(payload_data.decode())
                 
                 if msg.get('type') == 'ACK':
                     with lock:
@@ -103,6 +239,7 @@ def send_init():
                             grid = deepcopy(received_grid)
                     
                     print(f"[CLIENT] ACK received! Assigned ID: {client_id}")
+                    init_logging()  
                     return True
                     
             except socket.timeout:
@@ -128,42 +265,93 @@ def send_acquire(cell):
         'timestamp': time.time()
     }
     
+    payload = json.dumps(msg).encode()
+    header = create_header(MSG_TYPE_EVENT, 0, 0, payload)
+    packet = header + payload
+    
     try:
-        sock.sendto(json.dumps(msg).encode(), (SERVER_HOST, SERVER_PORT))
+        sock.sendto(packet, (SERVER_HOST, SERVER_PORT))
     except Exception as e:
         print(f"[CLIENT] Failed to send ACQUIRE_REQUEST: {e}")
 
 def receive_updates():
     """Background thread to receive SNAPSHOT and GAME_OVER messages"""
-    global grid, last_snapshot_id, running, game_over, winner
+    global grid, last_snapshot_id, running, game_over, winner, last_recv_time
     
     print("[CLIENT] Receive thread started")
     
     while running:
         try:
             data, addr = sock.recvfrom(65536)
-            msg = json.loads(data.decode())
-            msg_type = msg.get('type')
+            recv_time_ms = int(time.time() * 1000)
             
-            if msg_type == 'SNAPSHOT':
+            # Parse header
+            header = parse_header(data)
+            if not header:
+                continue
+            
+            # Extract and verify payload
+            payload = data[HEADER_SIZE:HEADER_SIZE + header['payload_len']]
+            calculated_checksum = zlib.crc32(payload) & 0xFFFFFFFF
+            if calculated_checksum != header['checksum']:
+                continue
+            
+            msg = json.loads(payload.decode())
+            msg_type_name = msg.get('type')
+            
+          
+            if header['msg_type'] == MSG_TYPE_DATA and msg_type_name == 'SNAPSHOT':
                 snapshot_id = msg.get('snapshot_id', -1)
+                server_timestamp_ms = header['server_timestamp']
+                seq_num = header['seq_num']
+                
+                # Calculate latency and jitter
+                latency_ms = recv_time_ms - server_timestamp_ms
+                latencies.append(latency_ms)
+                
+                jitter_ms = 0
+                if last_recv_time is not None:
+                    inter_arrival = recv_time_ms - last_recv_time
+                    if len(latencies) >= 2:
+                        jitter_ms = abs(inter_arrival - (1000.0 / 20))  # Expected 50ms at 20Hz
+                        jitter_values.append(jitter_ms)
+                
+                last_recv_time = recv_time_ms
+                
+               
+                log_snapshot_metrics(snapshot_id, seq_num, server_timestamp_ms, 
+                                    recv_time_ms, latency_ms, jitter_ms)
                 
                 with lock:
                     if snapshot_id > last_snapshot_id:
-                        # Apply full grid if present
                         if msg.get('full') and 'grid' in msg:
                             grid = deepcopy(msg['grid'])
                         
-                        # Apply changes
                         changes = msg.get('changes', [])
                         for change in changes:
                             r, c, owner = change
                             if 0 <= r < GRID_N and 0 <= c < GRID_N:
                                 grid[r][c] = owner
                         
+                 
+                        redundant = msg.get('redundant', [])
+                        for red_snapshot in redundant:
+                            red_changes = red_snapshot.get('changes', [])
+                            for change in red_changes:
+                                r, c, owner = change
+                                if 0 <= r < GRID_N and 0 <= c < GRID_N:
+                                    if grid[r][c] == 'UNCLAIMED':  # Don't overwrite newer state
+                                        grid[r][c] = owner
+                        
+                        snapshot_buffer.append({
+                            'snapshot_id': snapshot_id,
+                            'recv_time_ms': recv_time_ms,
+                            'grid_state': deepcopy(grid)
+                        })
+                        
                         last_snapshot_id = snapshot_id
             
-            elif msg_type == 'GAME_OVER':
+            elif header['msg_type'] == MSG_TYPE_EVENT and msg_type_name == 'GAME_OVER':
                 with lock:
                     game_over = True
                     winner = msg.get('winner')
@@ -171,37 +359,46 @@ def receive_updates():
                     if final_grid:
                         grid = deepcopy(final_grid)
                 
+                if latencies:
+                    avg_latency = sum(latencies) / len(latencies)
+                    print(f"[CLIENT] Average latency: {avg_latency:.2f}ms")
+                if jitter_values:
+                    avg_jitter = sum(jitter_values) / len(jitter_values)
+                    print(f"[CLIENT] Average jitter: {avg_jitter:.2f}ms")
+                
                 print(f"[CLIENT] GAME OVER! Winner: {winner}")
                 
         except socket.timeout:
             continue
         except Exception as e:
             if running:
-                pass  # Suppress errors when shutting down
+                pass  
         
         time.sleep(0.001)
 
 def main():
     global running, game_over, winner
     
-    # Initialize Pygame
+   
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
-    pygame.display.set_caption("Grid Clash Client")
+    pygame.display.set_caption("Grid Clash Client (NetRush Protocol with Interpolation)")
     clock = pygame.time.Clock()
     font = pygame.font.Font(None, 36)
+    small_font = pygame.font.Font(None, 24)
     
-    # Send INIT and wait for ACK
+    
     if not send_init():
         print("[CLIENT] Failed to initialize with server. Exiting.")
         pygame.quit()
         sys.exit(1)
     
-    # Start receive thread
+  
     recv_thread = threading.Thread(target=receive_updates, daemon=True)
     recv_thread.start()
     
     print(f"[CLIENT] Connected as Player {client_id}")
+    print(f"[CLIENT] Interpolation delay: {INTERPOLATION_DELAY_MS}ms")
     
     # Main game loop
     while running:
@@ -218,6 +415,7 @@ def main():
                 if 0 <= row < GRID_N and 0 <= col < GRID_N:
                     cell_index = row * GRID_N + col
                     
+                    # Use current grid (not interpolated) for click detection
                     with lock:
                         if grid[row][col] == 'UNCLAIMED':
                             send_acquire(cell_index)
@@ -225,15 +423,16 @@ def main():
         # Draw
         screen.fill(COLORS['background'])
         
+        # Get interpolated grid for smooth display
         with lock:
-            current_grid = deepcopy(grid)
+            display_grid = get_interpolated_grid()
             current_game_over = game_over
             current_winner = winner
         
         # Draw cells
         for r in range(GRID_N):
             for c in range(GRID_N):
-                owner = current_grid[r][c]
+                owner = display_grid[r][c]
                 color = get_player_color(owner)
                 
                 rect = pygame.Rect(c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE)
@@ -245,6 +444,10 @@ def main():
                     text = font.render(str(owner), True, COLORS['text'])
                     text_rect = text.get_rect(center=rect.center)
                     screen.blit(text, text_rect)
+        
+        # Draw interpolation indicator
+        info_text = small_font.render(f"Player {client_id} | Delay: {INTERPOLATION_DELAY_MS}ms", True, COLORS['text'])
+        screen.blit(info_text, (5, WINDOW_SIZE - 25))
         
         # Draw game over message
         if current_game_over:
@@ -265,6 +468,8 @@ def main():
         clock.tick(60)
     
     # Cleanup
+    if client_log_file:
+        client_log_file.close()
     pygame.quit()
     sock.close()
     print("[CLIENT] Shutting down")

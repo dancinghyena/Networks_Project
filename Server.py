@@ -1,92 +1,53 @@
 #!/usr/bin/env python3
-import socket
-import threading
-import json
-import time
-import csv
-import random
-import zlib
+import socket, threading, json, time, csv
 from collections import deque
 from copy import deepcopy
+import random
 
-# -----------------------
-# Config
-# -----------------------
 HOST = "0.0.0.0"
-PORT = 0  # 0 = let OS choose a free UDP port (avoids WinError 10048 conflicts)
-
+PORT = 5000
 GRID_N = 5
-UPDATE_RATE = 20              # snapshots per second
-FULL_EVERY = 10               # send full snapshot every N snapshots
-REDUNDANCY_K = 2              # include last K snapshot IDs as redundant metadata
-
-HEARTBEAT_TIMEOUT = 5         # seconds
-
+UPDATE_RATE = 20
+FULL_EVERY = 10
+REDUNDANCY_K = 2
 LOG_FILE = "server_log.csv"
+HEARTBEAT_TIMEOUT = 5
 
-# -----------------------
-# Network setup (MUST be before any recv/send)
-# -----------------------
+grid = [['UNCLAIMED' for _ in range(GRID_N)] for _ in range(GRID_N)]
+clients = {}  # { (ip,port) : {'id': n, 'last_heartbeat': t } }
+client_colors = {}  # client_id -> RGB
+lock = threading.Lock()
+seq = 0
+next_client_id = 1
+history = deque(maxlen=200)
+
+BASE_COLORS = [
+    (255, 0, 0), (0, 200, 0), (0, 0, 255), (255, 255, 0),
+    (255, 0, 255), (0, 255, 255), (128,128,0), (128,0,128)
+]
+
+server_csv = open(LOG_FILE, "w", newline="")
+server_writer = csv.DictWriter(server_csv, fieldnames=[
+    'log_time_ms','snapshot_id','seq','clients_count','bytes_sent_total'
+])
+server_writer.writeheader()
+
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind((HOST, PORT))
+sock.setblocking(True)
 
-# Actual chosen port
-PORT = sock.getsockname()[1]
-print(f"[SERVER] Listening on {HOST}:{PORT}")
+def assign_color(client_id):
+    if client_id <= len(BASE_COLORS):
+        return BASE_COLORS[client_id-1]
+    return (random.randint(50,255), random.randint(50,255), random.randint(50,255))
 
-# Write port so clients can read it (optional; you also use manual prompt in client)
-with open("server_port.txt", "w") as f:
-    f.write(str(PORT))
-
-# -----------------------
-# State
-# -----------------------
-grid = [["UNCLAIMED" for _ in range(GRID_N)] for _ in range(GRID_N)]
-grid_lock = threading.Lock()
-
-clients = {}  # addr -> {"id": int, "last_heartbeat": float}
-client_colors = {}  # client_id -> rgb tuple
-
-next_client_id = 1
-seq = 0
-
-# Snapshot history (for redundancy metadata / debugging)
-snapshot_history = deque(maxlen=200)  # store dicts with {snapshot_id, server_timestamp_ms, full, changes_count}
-
-
-# -----------------------
-# Helpers
-# -----------------------
-def stable_json_bytes(obj: dict) -> bytes:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
-
-
-def encode_with_checksum(packet: dict) -> bytes:
-    """
-    CRC32 checksum over the packet without the checksum field.
-    """
-    tmp = dict(packet)
-    tmp.pop("checksum", None)
-    raw = stable_json_bytes(tmp)
-    tmp["checksum"] = zlib.crc32(raw) & 0xFFFFFFFF
-    return stable_json_bytes(tmp)
-
-
-def assign_color(client_id: int):
-    random.seed(client_id * 99991)
-    return (random.randint(70, 255), random.randint(70, 255), random.randint(70, 255))
-
-
-def compute_changes(prev_grid, new_grid):
-    """
-    Return list of cell changes: [{"cell": idx, "value": owner_id_or_UNCLAIMED}, ...]
-    """
+def compute_changes(prev_grid, cur_grid):
     changes = []
     for r in range(GRID_N):
         for c in range(GRID_N):
-            if prev_grid[r][c] != new_grid[r][c]:
-                changes.append({"cell": r * GRID_N + c, "value": new_grid[r][c]})
+            if prev_grid[r][c] != cur_grid[r][c]:
+                changes.append([r, c, cur_grid[r][c]])
     return changes
 
 
@@ -132,219 +93,153 @@ server_csv.flush()
 # Incoming handler
 # -----------------------
 def handle_incoming():
-    """
-    Handles:
-      - Init / Init_ACK
-      - HEARTBEAT
-      - Event (reliable) -> ACK
-      - RESYNC_REQ -> send full SNAPSHOT immediately
-
-    Note: Windows can throw ConnectionResetError on UDP recvfrom if peer closes.
-          We ignore it.
-    """
-    global next_client_id
-
+    global grid, next_client_id
     while True:
         try:
             data, addr = sock.recvfrom(65536)
-        except ConnectionResetError:
-            # Windows UDP quirk when a peer closes; safe to ignore
+            msg = json.loads(data.decode())
+        except:
             continue
 
-        try:
-            msg = json.loads(data.decode(errors="ignore"))
-        except Exception:
-            continue
-
-        mtype = msg.get("type")
-
-        # INIT handshake
-        if mtype == "Init":
-            if addr not in clients:
+        with lock:
+            # New client
+            if addr not in clients and msg.get('type') == 'Init':
                 client_id = next_client_id
                 next_client_id += 1
-                clients[addr] = {"id": client_id, "last_heartbeat": time.time()}
+                clients[addr] = {'id': client_id, 'last_heartbeat': time.time()}
                 client_colors[client_id] = assign_color(client_id)
-                sock.sendto(stable_json_bytes({"type": "Init_ACK", "client_id": client_id}), addr)
-                print(f"[SERVER] New client: {addr} -> ID {client_id}")
-            else:
-                sock.sendto(stable_json_bytes({"type": "Init_ACK", "client_id": clients[addr]["id"]}), addr)
-            continue
-
-        # ignore unknown clients
-        if addr not in clients:
-            continue
-
-        # update heartbeat for any known message
-        clients[addr]["last_heartbeat"] = time.time()
-        client_id = clients[addr]["id"]
-
-        if mtype == "HEARTBEAT":
-            continue
-
-        # Reliable event from client (claim a cell)
-        if mtype == "Event":
-            try:
-                cell = int(msg.get("cell"))
-            except Exception:
+                sock.sendto(json.dumps({'type':'Init_ACK','client_id':client_id}).encode(), addr)
+                print(f"[SERVER] New client connected: ID {client_id}")
                 continue
 
-            # ACK immediately
-            sock.sendto(stable_json_bytes({"type": "ACK", "cell": cell}), addr)
+            if addr in clients:
+                clients[addr]['last_heartbeat'] = time.time()
 
-            r = cell // GRID_N
-            c = cell % GRID_N
+                if msg.get('type') == 'HEARTBEAT':
+                    continue
 
-            with grid_lock:
-                if 0 <= r < GRID_N and 0 <= c < GRID_N:
-                    if grid[r][c] == "UNCLAIMED":
-                        grid[r][c] = str(client_id)
-            continue
+                elif msg.get('type') == 'Event':
+                    cell = int(msg.get('cell'))
+                    client_id = clients[addr]['id']
+                    r = cell // GRID_N
+                    c = cell % GRID_N
+                    previous_owner = grid[r][c]
+                    if previous_owner == 'UNCLAIMED':
+                        grid[r][c] = client_id
+                        new_owner = client_id
+                    else:
+                        new_owner = previous_owner
+                    # ACK
+                    ack_msg = {'type':'ACK','cell':cell,'owner':new_owner}
+                    sock.sendto(json.dumps(ack_msg).encode(), addr)
 
-        # Client requests re-sync (send a full snapshot immediately)
-        if mtype == "RESYNC_REQ":
-            server_ts = int(time.time() * 1000)
-            with grid_lock:
-                cur_grid = deepcopy(grid)
-
-            full_packet = {
-                "type": "SNAPSHOT",
-                "snapshot_id": seq,
-                "seq": seq,
-                "server_timestamp_ms": server_ts,
-                "full": True,
-                "changes": [],
-                "redundant": [],
-                "grid": cur_grid,
-            }
-            sock.sendto(encode_with_checksum(full_packet), addr)
-            continue
-
-
-# -----------------------
-# Snapshot broadcaster
-# -----------------------
 def broadcast_loop():
-    """
-    Broadcasts:
-      - Full snapshot every FULL_EVERY ticks
-      - Delta snapshots otherwise
-    """
     global seq
-
-    prev = deepcopy(grid)
-    interval = 1.0 / UPDATE_RATE
-
+    prev_snapshot_grid = deepcopy(grid)
     while True:
-        start = time.time()
-        server_ts = int(start * 1000)
+        time.sleep(1.0 / UPDATE_RATE)
+        with lock:
+            cur_grid = deepcopy(grid)
 
-        with grid_lock:
-            cur = deepcopy(grid)
+            # Check if game over
+            flat = [cur_grid[r][c] for r in range(GRID_N) for c in range(GRID_N)]
+            if all(cell != 'UNCLAIMED' for cell in flat):
+                counts = {}
+                for owner in flat:
+                    counts[owner] = counts.get(owner,0)+1
+                max_score = max(counts.values())
+                winners = [k for k,v in counts.items() if v==max_score]
+                win_msg = {
+                    'type':'GAME_OVER',
+                    'winner': winners,  # list of winners
+                    'final_grid': deepcopy(cur_grid),
+                    'server_timestamp_ms': int(time.time()*1000)
+                }
+                for c in clients.keys():
+                    try:
+                        sock.sendto(json.dumps(win_msg).encode(), c)
+                    except:
+                        pass
+                print(f"[SERVER] GAME OVER → Winners: {winners}")
+                server_csv.close()
+                sock.close()
+                return
 
-        seq += 1
-        is_full = (seq % FULL_EVERY == 0)
+        snapshot_id = seq
+        server_ts = int(time.time() * 1000)
+        changes = compute_changes(prev_snapshot_grid, cur_grid)
+        full_flag = (snapshot_id % FULL_EVERY == 0) or (snapshot_id==0)
+        entry = {
+            'snapshot_id': snapshot_id,
+            'server_timestamp_ms': server_ts,
+            'changes': changes,
+            'full': full_flag
+        }
+        history.append(entry)
 
-        if is_full:
-            packet = {
-                "type": "SNAPSHOT",
-                "snapshot_id": seq,
-                "seq": seq,
-                "server_timestamp_ms": server_ts,
-                "full": True,
-                "changes": [],
-                "redundant": [h["snapshot_id"] for h in list(snapshot_history)[-REDUNDANCY_K:]],
-                "grid": cur,
-            }
-            changes_count = GRID_N * GRID_N
-        else:
-            changes = compute_changes(prev, cur)
-            packet = {
-                "type": "SNAPSHOT",
-                "snapshot_id": seq,
-                "seq": seq,
-                "server_timestamp_ms": server_ts,
-                "full": False,
-                "changes": changes,
-                "redundant": [h["snapshot_id"] for h in list(snapshot_history)[-REDUNDANCY_K:]],
-            }
-            changes_count = len(changes)
+        redundant = []
+        hist_list = list(history)
+        if len(hist_list) >= 2:
+            for h in hist_list[-1-REDUNDANCY_K:-1]:
+                if h: redundant.append({'snapshot_id':h['snapshot_id'],'changes':h['changes']})
 
-        payload = encode_with_checksum(packet)
+        packet = {
+            'type':'SNAPSHOT',
+            'snapshot_id':snapshot_id,
+            'seq':snapshot_id,
+            'server_timestamp_ms':server_ts,
+            'full':full_flag,
+            'changes':changes,
+            'redundant':redundant
+        }
+        if full_flag:
+            packet['grid'] = cur_grid
 
-        # send to all clients
-        for addr in list(clients.keys()):
+        payload = json.dumps(packet).encode()
+        bytes_sent_total = 0
+        with lock:
+            targets = list(clients.keys())
+        for c in targets:
             try:
-                sock.sendto(payload, addr)
-            except Exception:
+                sock.sendto(payload, c)
+                bytes_sent_total += len(payload)
+            except:
                 pass
 
-        # Log snapshot metadata
-        server_writer.writerow(
-            {
-                "snapshot_id": seq,
-                "server_timestamp_ms": server_ts,
-                "full": int(is_full),
-                "changes_count": changes_count,
-                "clients_count": len(clients),
-            }
-        )
+        server_writer.writerow({
+            'log_time_ms': int(time.time()*1000),
+            'snapshot_id': snapshot_id,
+            'seq': snapshot_id,
+            'clients_count': len(targets),
+            'bytes_sent_total': bytes_sent_total
+        })
         server_csv.flush()
+        prev_snapshot_grid = cur_grid
+        seq += 1
 
-        snapshot_history.append(
-            {
-                "snapshot_id": seq,
-                "server_timestamp_ms": server_ts,
-                "full": bool(is_full),
-                "changes_count": changes_count,
-            }
-        )
-
-        # game over check
-        winners = check_game_over(cur)
-        if winners is not None:
-            game_over_pkt = stable_json_bytes({"type": "GAME_OVER", "winner": winners})
-            for addr in list(clients.keys()):
-                try:
-                    sock.sendto(game_over_pkt, addr)
-                except Exception:
-                    pass
-
-        prev = cur
-
-        # sleep remainder
-        elapsed = time.time() - start
-        if elapsed < interval:
-            time.sleep(interval - elapsed)
-
-
-# -----------------------
-# Heartbeat checker
-# -----------------------
 def heartbeat_checker():
     while True:
-        now = time.time()
-        for addr in list(clients.keys()):
-            if now - clients[addr]["last_heartbeat"] > HEARTBEAT_TIMEOUT:
-                print(f"[SERVER] Client timed out: {addr} (ID {clients[addr]['id']})")
-                del clients[addr]
         time.sleep(1)
-
+        now = time.time()
+        with lock:
+            to_remove = [addr for addr,data in clients.items() if now - data['last_heartbeat'] > HEARTBEAT_TIMEOUT]
+            for addr in to_remove:
+                print(f"[Server] Client {clients[addr]['id']} timed out")
+                del clients[addr]
 
 # -----------------------
 # Main
 # -----------------------
 if __name__ == "__main__":
-    print(f"Server starting on {HOST}:{PORT} | Grid={GRID_N}x{GRID_N}")
-
+    print(f"Server starting on {HOST}:{PORT} Grid={GRID_N}x{GRID_N}")
     threading.Thread(target=handle_incoming, daemon=True).start()
     threading.Thread(target=broadcast_loop, daemon=True).start()
     threading.Thread(target=heartbeat_checker, daemon=True).start()
-
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Shutting down server.")
-        server_csv.close()
-        sock.close()
+        while running: time.sleep(0.5)
+    except KeyboardInterrupt: 
+        running = False
+    
+    csv_file.close()
+    sock.close()
+    print("[SERVER] Stopped")

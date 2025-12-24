@@ -1,119 +1,178 @@
-# Networks Project — UDP Demo (Server & Client)
+# NetRush Protocol - Grid Clash Game
 
-This repository contains a minimal **UDP-based** networking demo with a `Server.py` and a `client.py` that exchange messages using a compact header inspired by a mini RFC.
+A UDP-based multiplayer game state synchronization protocol for the Grid Clash game, implementing Project 2 requirements for Computer Networks.
 
-> **Quick start:** open **two terminals**. In one, run the server; in the other, run the client. By default both bind/connect to `127.0.0.1:5005`.
+## Protocol Overview
 
----
+**NetRush (NRSH)** is a custom binary protocol designed for low-latency game state synchronization over UDP.
 
-## Contents
+### Binary Header Format (28 bytes)
 
-- `Server.py` – UDP server that receives `INIT` and `DATA` messages and sends `ACK`s.
-- `client.py` – UDP client that sends `INIT` and periodic `DATA` messages and listens for `ACK`s.
-- `tests/baseline_local.md` – A step-by-step **Baseline local** scenario to verify everything works on your machine.
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 4 | protocol_id | `b"NRSH"` |
+| 4 | 1 | version | Protocol version (1) |
+| 5 | 1 | msg_type | Message type (0-6) |
+| 6 | 4 | snapshot_id | Snapshot identifier |
+| 10 | 4 | seq_num | Sequence number |
+| 14 | 8 | timestamp | Milliseconds since epoch |
+| 22 | 2 | payload_len | Payload length |
+| 24 | 4 | checksum | CRC32 checksum |
 
----
+### Message Types
+
+| Code | Type | Description |
+|------|------|-------------|
+| 0 | INIT | Client connection request |
+| 1 | INIT_ACK | Server connection acknowledgment |
+| 2 | SNAPSHOT | Game state update |
+| 3 | EVENT | Cell claim request |
+| 4 | ACK | Event acknowledgment |
+| 5 | HEARTBEAT | Keep-alive |
+| 6 | GAME_OVER | Game end notification |
 
 ## Requirements
 
-- Python **3.9+** (standard library only: `socket`, `struct`, `time`, `zlib`, `threading`).
-- OS: Linux, macOS, or Windows.
+- Python 3.9+
+- pygame (`pip install pygame`)
+- psutil (optional, for CPU monitoring): `pip install psutil`
 
-No external packages are needed.
+## Quick Start
 
----
-
-## Configuration
-
-Both scripts expose simple constants at the top of the files:
-
-```python
-SERVER_IP = "127.0.0.1"
-SERVER_PORT = 5005
-```
-
-You can edit these values directly in both `Server.py` and `client.py` to change where the server listens and where the client sends.
-
-> Tip: Keep them on `127.0.0.1` for local testing first.
-
----
-
-## Protocol (high level)
-
-The header format matches the comment in the code:
-
-```
-!4s B B I I Q H I
-└── ─ ─ ─ ─ ─ ─ ─
-  protocol_id (4s) = b"NRSH"
-  version     (B)  = 1
-  msg_type    (B)  = 0=INIT, 1=DATA, 3=ACK
-  snapshot_id (I)  = reserved (0 in baseline)
-  seq_num     (I)  = sequence number
-  timestamp   (Q)  = milliseconds epoch
-  payload_len (H)  = bytes in payload
-  checksum    (I)  = CRC32 of header-without-checksum + payload
-```
-
-Server behavior (summary):
-- Prints each `INIT`/`DATA` packet.
-- Replies with `ACK` using the same `seq_num`.
-
-Client behavior (summary):
-- Sends one `INIT`, then sends periodic `DATA` messages (e.g., a simple text payload).
-- Listens on a background thread for `ACK`s and prints them.
-
----
-
-## How to Run
-
-### 1) Start the server
+### 1. Start the Server
 
 ```bash
-cd Networks_Project-main
 python Server.py
 ```
 
-You should see logs like:
-
+Expected output:
 ```
-[Server] listening on 127.0.0.1:5005 ...
+[SERVER] NetRush Server starting on 0.0.0.0:5000
+[SERVER] Grid=20x20, UpdateRate=20Hz
+[SERVER] Binary protocol with CRC32 checksum enabled
 ```
 
-### 2) Run the client (in a second terminal)
+### 2. Start Client(s)
+
+In separate terminals:
 
 ```bash
-cd Networks_Project-main
 python client.py
 ```
 
-Expected output includes lines like:
+Each client will:
+1. Connect to the server
+2. Receive a unique player ID
+3. Display the game grid
+4. Allow clicking cells to claim them
 
+## Configuration
+
+Edit the constants at the top of each file:
+
+### Server.py
+```python
+HOST = "0.0.0.0"      # Listen address
+PORT = 5000           # UDP port
+GRID_N = 20           # Grid size (20x20)
+UPDATE_RATE = 20      # Snapshots per second
 ```
-[Client] INIT sent, seq 1
-[Client] DATA sent, seq 2: "hello"
-[Client] ACK received for seq 1
-[Client] ACK received for seq 2
+
+### client.py
+```python
+SERVER_IP = "127.0.0.1"  # Server address
+SERVER_PORT = 5000       # Server port
+GRID_N = 20              # Must match server
 ```
 
-> If you get a firewall prompt on Windows/macOS, allow Python to receive incoming UDP for the server.
+## Game Rules (Grid Clash)
 
----
+1. All players see a shared 20×20 grid
+2. Cells start as "unclaimed" (gray)
+3. Click a cell to claim it (turns your color)
+4. First-come-first-served (ties resolved by timestamp)
+5. Game ends when all cells are claimed
+6. Winner has the most cells
+
+## Protocol Features
+
+| Feature | Implementation |
+|---------|----------------|
+| Transport | UDP |
+| Reliability | Selective ACK for events, redundant updates for snapshots |
+| Loss Tolerance | K=2 redundant changes per packet |
+| Ordering | Snapshot ID + client-side reordering |
+| Smoothing | 100ms interpolation delay |
+| Conflict Resolution | Server-authoritative, earliest timestamp wins |
+| Checksum | CRC32 on all packets |
+
+## Metrics Logged
+
+### Server (server_log.csv)
+- `snapshot_id`, `seq`, `clients_count`
+- `bytes_sent_total`, `bandwidth_per_client_kbps`
+- `cpu_percent`
+
+### Client (client_N_log.csv)
+- `snapshot_id`, `server_timestamp_ms`, `recv_time_ms`
+- `latency_ms`, `jitter_ms`
+- `perceived_position_error`, `cpu_percent`
+
+## Running Tests (Linux)
+
+Use the provided test script with netem:
+
+```bash
+chmod +x run_all_tests.sh
+sudo ./run_all_tests.sh eth0
+```
+
+This runs:
+1. Baseline (no impairment)
+2. 2% packet loss
+3. 5% packet loss
+4. 100ms delay
+5. 100ms delay + 10ms jitter
+
+## Manual netem Commands
+
+```bash
+# Add 5% loss
+sudo tc qdisc add dev eth0 root netem loss 5%
+
+# Add 100ms delay with 10ms jitter
+sudo tc qdisc add dev eth0 root netem delay 100ms 10ms
+
+# Remove impairment
+sudo tc qdisc del dev eth0 root
+```
 
 ## Troubleshooting
 
-- **Address already in use**: change `SERVER_PORT` to a free port (e.g., 5006) in both files.
-- **No ACKs show up**: ensure the server is running, and that both files have the same IP/port; check firewall.
-- **Garbled decode**: `payload.decode(errors="ignore")` drops undecodable bytes. Keep payloads as UTF‑8 text for the demo.
+| Issue | Solution |
+|-------|----------|
+| Port already in use | Change PORT in both files, or kill existing process |
+| No connection | Check firewall, ensure same IP/port |
+| psutil warning | Install with `pip install psutil` (optional) |
+| Packet too large | Reduce REDUNDANCY_K or grid size |
 
----
+## Project Structure
 
-## Next steps (nice to have)
+```
+project/
+├── Server.py           # Game server
+├── client.py           # Game client (pygame)
+├── protocol.py         # Shared binary protocol module
+├── run_all_tests.sh    # Automated test runner
+├── server_log.csv      # Server metrics output
+├── client_*_log.csv    # Client metrics output
+└── README.md           # This file
+```
 
-- CLI args (e.g., `--ip`, `--port`) using `argparse` instead of editing constants.
-- Add retransmission/timeout logic on the client if an `ACK` isn’t received.
-- Persist basic metrics (latency from `timestamp`, packet count, loss).
+## Authors
 
----
+Computer Networks - Project 2
 
-*Generated on 2025-11-04 22:56 *
+## Video Demo
+
+[Link to demo video: TODO - add your link here]

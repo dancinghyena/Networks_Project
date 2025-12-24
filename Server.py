@@ -1,11 +1,76 @@
 #!/usr/bin/env python3
-import socket, threading, json, time, csv
+import socket, threading, json, time, csv, os, sys
 from collections import deque
 from copy import deepcopy
 import random
 
 HOST = "0.0.0.0"
-PORT = 5000
+
+# Determine port dynamically in this order:
+# 1) command-line first arg (integer)
+# 2) environment variable `SERVER_PORT`
+# 3) contents of `server_port.txt` in the script directory
+# 4) 0 to let the OS pick an ephemeral port
+def _read_port_file(path):
+    try:
+        with open(path, 'r') as f:
+            txt = f.read().strip()
+            if txt:
+                return int(txt)
+    except Exception:
+        return None
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+port_file = os.path.join(script_dir, 'server_port.txt')
+
+def get_desired_port():
+    # Gather potential sources for a default candidate (CLI arg > env > port file)
+    candidate = None
+    if len(sys.argv) > 1:
+        try:
+            candidate = int(sys.argv[1])
+        except Exception:
+            candidate = None
+    if candidate is None:
+        envp = os.getenv('SERVER_PORT')
+        if envp:
+            try:
+                candidate = int(envp)
+            except Exception:
+                candidate = None
+    if candidate is None:
+        pf = _read_port_file(port_file)
+        if pf:
+            candidate = pf
+
+    # If running interactively, always prompt the user and show the candidate as default.
+    try:
+        if sys.stdin and sys.stdin.isatty():
+            prompt_default = str(candidate) if candidate else 'blank (OS selects)'
+            for _ in range(3):
+                try:
+                    s = input(f"Choose server port [{prompt_default}]: ").strip()
+                except EOFError:
+                    s = ''
+                if s == '':
+                    # Use candidate if available, otherwise let OS pick
+                    return candidate if candidate else 0
+                try:
+                    p = int(s)
+                    if 1 <= p <= 65535:
+                        return p
+                except Exception:
+                    pass
+                print("Invalid port. Enter a number 1-65535 or blank to accept default.")
+            # fallback if user fails to provide valid input
+            return candidate if candidate else 0
+    except Exception:
+        pass
+
+    # Non-interactive: use candidate if present, otherwise let OS pick
+    return candidate if candidate else 0
+
+PORT = get_desired_port()
 GRID_N = 5
 UPDATE_RATE = 20
 FULL_EVERY = 10
@@ -35,6 +100,17 @@ server_writer.writeheader()
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind((HOST, PORT))
+# If we bound to port 0, or if we read the desired port from file/env/cli,
+# determine the actual bound port and persist it to `server_port.txt` for clients.
+actual_port = sock.getsockname()[1]
+if actual_port != PORT:
+    PORT = actual_port
+try:
+    with open(port_file, 'w') as pf:
+        pf.write(str(PORT))
+except Exception:
+    pass
+
 sock.setblocking(True)
 
 def assign_color(client_id):

@@ -312,10 +312,18 @@ if __name__ == "__main__":
     threading.Thread(target=broadcast_loop, daemon=True).start()
     threading.Thread(target=heartbeat_checker, daemon=True).start()
     try:
-        while running: time.sleep(0.5)
-    except KeyboardInterrupt: 
-        running = False
-    
-    csv_file.close()
-    sock.close()
-    print("[SERVER] Stopped")
+        # Main thread idles until interrupted
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("[SERVER] KeyboardInterrupt received, shutting down...")
+    finally:
+        try:
+            server_csv.close()
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+        print("[SERVER] Stopped")
